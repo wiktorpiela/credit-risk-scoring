@@ -1,0 +1,542 @@
+---
+title: "Credit risk rating and scoring"
+author: Wiktor Piela
+output: github_document
+always_allow_html: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      error = FALSE,
+                      message = FALSE)
+library("tidyverse")
+library("tidymodels")
+library("ggridges")
+library("probably")
+library("discrim")
+library("kableExtra")
+
+set.seed(123)
+```
+
+```{r data_prep}
+credit <- read_csv("data/credit_risk_dataset.csv") %>% 
+  distinct() %>% 
+  filter(person_age<100,
+         person_emp_length<100) %>% 
+  mutate_if(is.character,as.factor) %>% 
+  mutate(loan_percent_income = loan_amnt/person_income,
+         cb_person_default_on_file = as.factor(ifelse(cb_person_default_on_file=="N",0,1)),
+         loan_status = as.factor(loan_status),
+         loan_status = fct_relevel(loan_status, "1"))
+```
+
+## Dane
+
+Źródłem danych jest kaggle.com - https://www.kaggle.com/datasets/laotse/credit-risk-dataset. W zbiorze są dostępne następujące cechy klientów:
+
+* wiek
+* roczny przychód
+* forma własności domu
+* jak długo klient jest zatrudniony (w latach)
+* cel kredytu
+* grade kredytowy przypisany na podstawie historycznych danych
+* kwota kredytu oraz oprocentowanie
+* informacja, czy były opóźnienia w spłacie (zmienna zależna, która będzie modelowana)
+* jaki odsetek rocznego przychodu stanowi kwota kredytu
+* czy w przeszłości zaistniały opóźnienia w spłacie rat
+* długość historii kredytowej (w latach)
+
+Liczba obserwacji równa jest `r format(nrow(credit), big.mark=" ")`, z czego, dla zmiennej oprocentowanie kredytu, w `r format(nrow(filter(credit, is.na(loan_int_rate))), big.mark=" ")`` obserwacjach występują braki danych.
+
+Poniżej pierwsze pięć obserwacji zbioru:
+
+```{r header}
+credit %>% 
+  head() %>% 
+  kable() %>% 
+  kable_material(c("striped", "hover")) %>% 
+  row_spec(0, background = "cadetblue") 
+```
+
+## Cel analizy
+
+Należy przede wszystkim zbadać, jakie zależności prezentują dane. Następnie przeprowadzone zostanie modelowanie statystycznie przy użyciu kilku metod uczenia maszynowego w celu oceny ryzyka kredytowego - tzn. sklasyfikowania klienta, czy na podstawie wykazywanych przez siebie cech, wystąpią opóźnienia w spłacie kredytu. Ten model, który uzyska najlepszą efektywność zostanie ostatecznie wybrany. 
+
+*Dane oraz sytuacja mają charakter bardzo uproszczony - celem jest jedynie przeprowadzenie oceny ryzyka kredytowego za pomocą poznanych metod statystycznego uczenia maszynowego oraz prezentacja użytych w tym celu narzędzi. Dane wygenerowane automatycznie.*
+
+## Eksploracja
+
+Po pierwsze, eksplorując zbiór danych możemy z łatwością dostrzec dość intuicyjne zależności - 
+
+* osoby z starsze mają dłuższą historię kredytową
+
+```{r plot1}
+ggplot(credit[sample(nrow(credit),2000),],aes(person_age,cb_person_cred_hist_length))+
+  geom_jitter()+
+  theme_minimal()+
+  labs(x = "Wiek",
+       y = "Długość historii kredytowej")
+```
+
+* oprocentowanie kredytu zależne jest od przyznanego greade'u kredytowego - klienci bardziej godni zaufania mają przyznawane średnio tańsze kredyty
+
+```{r plot2}
+ggplot(credit, aes(loan_int_rate,loan_grade,fill=stat(y)))+
+  geom_density_ridges_gradient()+
+  theme_minimal()+
+  scale_fill_gradient(low = "#377EB8",
+                      high = "#E41A1C")+
+  theme(legend.position = "none")+
+  labs(y = "Grade",
+       x = "Oprocentowanie kredytu")
+```
+
+* klienci z wyższą wartością stosunku kwoty zaciągniętego kredytu do sumy rocznego przychodu danego mają większe problemy z jego spłatą
+
+```{r plot3}
+credit %>% 
+  mutate(loan_status = fct_recode(loan_status,
+                                  `Nie było opóźnień w spłatach`="0",
+                                  `Były opóźnienia w spłatach`="1")) %>% 
+  ggplot(aes(loan_percent_income,fill=loan_status))+
+  geom_density(alpha=0.7)+
+  theme_minimal()+
+  labs(x = "Relacja kwota kredytu/roczny przychód",
+       y = "",
+       fill="Klienci, u których:")+
+  scale_fill_manual(values = c("#377EB8","#E41A1C"))
+```
+
+* klienci z mniejszym rocznym przychodem zaciągali średnio kredyty mniejszej wartości (co niewątpliwie wynika wprost z ich zdolności kredytowej), dodatkowo - ponownie widać, że klienci opóźniający się ze spłatą kredytów to ci zarabiający ogólnie mniej niż spłacający w terminie
+
+```{r plot4}
+set.seed(123)
+credit[sample(nrow(credit),2000),] %>% 
+  mutate(loan_status = fct_recode(loan_status,
+                                  `Nie było opóźnień w spłatach`="0",
+                                  `Były opóźnienia w spłatach`="1")) %>%
+  ggplot(aes(loan_amnt,person_income,col=loan_status))+
+  geom_jitter()+
+  geom_smooth()+
+  scale_x_continuous(labels = function(x) format(x, scientific = FALSE, big.mark=" "))+
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE, big.mark=" "))+
+  theme_minimal()+
+  labs(x = "Kwota kredytu",
+       y = "Roczny przychód",
+       col="Klienci, u których:")+
+  theme(legend.position = "bottom")+
+  scale_color_manual(values = c("#377EB8","#E41A1C"))
+```
+
+Co ciekawe, jeśli zestawimy ze sobą informacje o tym, czy w przeszłości klient spóźniał się ze wpłatą raty wraz z tym, czy miało to miejsce przy kredycie w badanym zbiorze, zauważymy poniższą zależność.
+
+```{r crosstab}
+descr::crosstab(credit$cb_person_default_on_file,
+                credit$loan_status,
+                prop.r = TRUE,
+                plot=FALSE)
+```
+
+Wśród wszystkich osób, które wcześniej miały problemy ze spłatą, sytuacja powtórzyła się u ponad 37% klientów
+
+## Modelowanie
+
+Pierwszym krokiem będzie podział zbiorów na treningowy oraz testowy w proporcji 80/20, dbając jednocześnie o to, aby w każdym z nich była odpowiednia reprezentacja zmiennej zależnej.
+
+```{r train_test_split, echo=TRUE}
+set.seed(123)
+credit_split <- initial_split(credit, prop = 0.8, strata = loan_status)
+credit_train <- training(credit_split)
+credit_test <- testing(credit_split)
+```
+
+Ponadto, aby nie dodawać do zbiorów danych predykcji każdego modelu, stworzone zostaną dwie dodatkowe ramki danych (dla estymacji na zbiorze testowym i treningowym), gdzie będą przechowywane te predykcje w formie prawdopodobieństwa przynależności klienta do danej klasy. Na początku dodane zostaną tam rzeczywiste etykiety klientów. Dodatkowo, zdefiniowana zostanie funkcja ułatwiająca dodawanie kolejnych predykcji.
+
+```{r new_frames, echo=TRUE}
+model_train_performance <- tibble(
+  actual = credit_train$loan_status
+  )
+
+model_test_performance <- tibble(
+  actual = credit_test$loan_status
+)
+
+add_predictions <- function(main_df,model,data,name_1,name_0){
+  
+  preds <- predict(model, data, type = "prob") %>% 
+    set_names(c(name_1,name_0))
+  
+  main_df <- add_column(main_df, preds)
+  
+  return(main_df)
+}
+```
+
+Jeszcze zanim przejdziemy do trenowania modeli, niezbędne będzie stworzenie recepty. Niezależnie od wykorzystanej potem metody, zmienną objaśnianą zawsze będzie przynależność klienta do danej klasy - 0 brak opóźnień w spłacie rat lub 1 - opóźnienia. Jako predyktory do sklasyfikowania etykiety klienta zostaną wykorzystane wszystkie inne zmienne. Z uwagi na występujące w zbiorze braki danych dla zmiennej - oprocentowanie kredytu, do recepty dodajemy imputację braków danych - tworząc do tego celu pomocniczy model lasu losowego.
+
+```{r recepta, echo=TRUE}
+credit_recipe <- recipe(loan_status~.,credit_train) %>% 
+  step_impute_bag(loan_int_rate)
+```
+
+## Kryteria oceny modelu
+
+Typowo odpowiedzią wykorzystanych poniżej klasyfikatorów jest prawdopodobieństwo przynależności danej obserwacji do klasy pozytywnej (opóźnienie w spłacie kredytu). W celu przypisania estymacji ostatecznie danej klasy i obliczenia takich metryk jak czułość, swoistość czy precyzja, niezbędne jest ustalenie thresholdu, którego poziom zawsze jest specyficzny dla danego problemu i ustalany indywidualnie zgodnie z widzą dziedzinową. Istnieje jednak miara skuteczności modelu, którą można wyrazić bez ustalania konkretnej wartości progu - pole od krzywą ROC. Referencyjnie - AUC dla idealnego modelu będzie miało wartość równą 1, a dla losowego 0.5. 
+
+Dodatkowo, z uwagi na brak zbalansowania liczebności klas w zbiorze danych, rozpatrywanie accuracy jako potencjalnej metryki oceny modelu nie jest dobrym pomysłem.
+
+```{r accuracy}
+credit %>% 
+  mutate(loan_status = fct_recode(loan_status,
+                                  `Klasa pozytywna` = "1",
+                                  `Klasa negatywna` = "0")) %>% 
+  ggplot(aes(loan_status, fill=loan_status))+geom_bar()+
+  scale_y_continuous(labels = function(x) format(x, big.mark=" "))+
+  labs(x = "",
+       y = "Zliczenia")+
+  scale_fill_manual(values = c("#377EB8","#E41A1C"))+
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+### Regresja logistyczna
+
+Pierwszą wykorzystaną metodą będzie klasyfikator liniowy dokonujący binarnej klasyfikacji korzystając z funkcji logistycznej, której odpowiedzią jest prawdopodobieństwo przynależności obserwacji do danej klasy. Jednak z uwagi na nieliniowy charakter prawdopodobieństwa regresja logistyczna modeluje logarytm szans przynależności obserwacji do klasy 0 lub 1, które następnie mapowane są na prawdopodobieństwa (wartości z przedziału od 0 do 1).
+
+Poniżej tworzymy model trenowany na zbiorze treningowym, następnie przy pomocy zdefiniowanej wcześniej funkcji dodajemy predykcje modelu zarówno na zbiorze testowym jak i treningowym.
+
+```{r reg_log, echo=TRUE, cache=TRUE}
+glm_model <- logistic_reg()
+
+glm_wflow <- workflow() %>%
+  add_model(glm_model) %>% 
+  add_recipe(credit_recipe)
+
+glm_fit <- glm_wflow %>% 
+  fit(credit_train)
+
+
+model_train_performance <- add_predictions(model_train_performance,
+                                           glm_fit,
+                                           credit_train,
+                                           "glm_pred_1",
+                                           "glm_pred_0")
+
+model_test_performance <- add_predictions(model_test_performance,
+                                          glm_fit,
+                                          credit_test,
+                                          "glm_pred_1",
+                                          "glm_pred_0")
+```
+
+### Naiwny klasyfikator bayesowski
+
+Prawdopodobieństwa zwracane przez ten klasyfikator szacowane są na podstawie empirycznej częstości występowania cech obserwacji. Zakłada on ponadto ich niezależność (naiwność).
+
+```{r bayes, echo=TRUE, cache=TRUE}
+bayes_model <- naive_Bayes()
+
+bayes_wflow <- workflow() %>%
+  add_model(bayes_model) %>% 
+  add_recipe(credit_recipe)
+
+bayes_fit <- bayes_wflow %>% 
+  fit(credit_train)
+
+xx <- predict(bayes_fit, credit_train, type="prob")
+
+model_train_performance <- add_predictions(model_train_performance,
+                                           bayes_fit,
+                                           credit_train,
+                                           "bayes_pred_1",
+                                           "bayes_pred_0")
+
+model_test_performance <- add_predictions(model_test_performance,
+                                          bayes_fit,
+                                          credit_test,
+                                          "bayes_pred_1",
+                                          "bayes_pred_0")
+```
+
+### KNN
+
+Klasyfikator k najbliższych sąsiadów bierze pod uwagę obserwacje znajdujące się najbliżej (odległość euklidesowa) klasyfikowanej obserwacji. Zwraca zatem prawdopodobieństwo - jeżeli 5 najbliższych sąsiadów trzech należy do klasy 0, a dwóch pozostałych do klasy 1, to istnieje prawdopodobieństwo równe 60%, że klasyfikowana obserwacja to klasa 0, a 40%, że należy jej przypisać etykietę 1.
+
+Proces modelowania knn będzie różnił się od wcześniejszych:
+
+* po pierwsze - z uwagi na konieczność znormalizowania wszystkich zmiennych numerycznych, niezbędna jest aktualizacja zdefiniowanej wcześniej recepty
+
+* po drugie - predykcje modelu będą ściśle zależne od tego, jaka wartość k zostanie wybrana. Zatem w trakcie 5 - krotnej walidacji krzyżowej wartość hiperparametru k będzie tuningowana i finalnie zostanie wybrana taka, która daje najlepsze rezultaty estymacji (największa wartość pola pod krzywą ROC - AUC). Na początku zostanie sprawdzone 10 wartości k zdefiniowanych w pakiecie tidymodels domyślnie.
+
+```{r knn, echo=TRUE, cache=TRUE}
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_recipe <- credit_recipe %>%
+  step_normalize(all_numeric_predictors())
+
+knn_wflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(knn_recipe)
+
+knn_tune <- knn_wflow %>% tune_grid(
+  resamples = vfold_cv(credit_train, v=5, strata=loan_status),
+  grid = 10,
+  metrics = metric_set(roc_auc),
+  control = control_grid(verbose = TRUE)
+  )
+```
+
+Wraz ze wzrostem k, AUC zwiększa się. Oznacza to, że można spróbować sprawdzić większą wartość k, ponieważ im większa wartość tego hiperparametru, tym mniej skomplikowany jest model.
+
+```{r knn2}
+show_best(knn_tune) %>% 
+  kable() %>% 
+  kable_material(c("striped", "hover")) %>% 
+  row_spec(0, background = "cadetblue") 
+
+autoplot(knn_tune)
+```
+
+Sprawdźmy, dla jakiej wartości k, AUC zaczyna spadać - innymi słowy jakie k najlepiej wybrać, aby - model był mniej skomplikowany, a przy czym pole pod krzywą ROC było jak największe.
+
+```{r knn3, echo=TRUE, cache=TRUE}
+knn_tune <- knn_wflow %>% tune_grid(
+  resamples = vfold_cv(credit_train, v=5, strata=loan_status),
+  grid = data.frame(neighbors = seq(10,250,5)),
+  metrics = metric_set(roc_auc),
+  control = control_grid(verbose = TRUE)
+ )
+```
+
+Ostatecznie widać, że wartość hiperparamteru około 70 wydaje się mieć najlepszą efektywność, dlatego taka tez wartość zostanie wybrana. 
+
+```{r knn4}
+show_best(knn_tune) %>%
+  kable() %>%
+  kable_material(c("striped", "hover")) %>%
+  row_spec(0, background = "cadetblue")
+
+autoplot(knn_tune)
+```
+
+Finalny model knn został wytrenowany dla k=70, a jego estymacje dodane. 
+
+```{r knn5, echo=TRUE, cache=TRUE}
+params <- select_best(knn_tune, metric = "roc_auc")
+
+knn_fit <- knn_wflow %>%
+  finalize_workflow(params) %>%
+  fit(credit_train)
+
+
+model_train_performance <- add_predictions(model_train_performance,
+                                           knn_fit,
+                                           credit_train,
+                                           "knn_pred_1",
+                                           "knn_pred_0")
+
+model_test_performance <- add_predictions(model_test_performance,
+                                          knn_fit,
+                                          credit_test,
+                                          "knn_pred_1",
+                                          "knn_pred_0")
+```
+
+### Drzewo decyzyjne
+
+Klasyfikator drzewa decyzyjnego dokonuje podziału przestrzeni n-wymiarowej predyktorów w taki sposób, aby po podziale:
+
+* zminimalizować procentową liczbę błędów lub
+
+* zminimalizować index Giniego / entropię
+
+Gdy algorytm skończy pracę (dokonanie kolejnego podziału nie polepszy modelu) zwracane jest prawdopodobieństwo przynależności klasyfikowanej obserwacji w obszarze podziału. Istnieje wiele hiperparametrów dla drzewa decyzyjnego, jednak praktyka najczęściej pokazuje, że strojenie **complexity parameter (kara za rozmiar drzewa)** przyniesie najlepsze rezultaty.
+
+```{r rpart, echo=TRUE,cache=TRUE}
+rpart_model <- decision_tree(cost_complexity = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+rpart_wflow <- workflow() %>%
+  add_model(rpart_model) %>%
+  add_recipe(credit_recipe)
+
+rpart_tune <- rpart_wflow %>% tune_grid(
+  resamples = vfold_cv(credit_test, v = 5, strata = loan_status),
+  grid = 10,
+  metrics = metric_set(roc_auc),
+  control = control_grid(verbose = TRUE)
+)
+```
+
+W procesie kroswalidacji i strojenia hiperparametru *cp* wyraźnie widać, że zdolności predykcyjne drzewa wyraźnie maleją, gdy wartość cp jest powyżej wartości $10^{-4}$ .
+
+```{r rpart2}
+show_best(rpart_tune, metric = "roc_auc") %>% 
+  kable() %>%
+  kable_material(c("striped", "hover")) %>%
+  row_spec(0, background = "cadetblue")
+
+autoplot(rpart_tune)
+```
+
+Ostatecznie jako najlepsze zostanie wybrane takie drzewo, dla którego wartość cp jest równa $1.68*10^{-9}$
+
+```{r rpart3, cache=TRUE}
+params <- select_best(rpart_tune, metric = "roc_auc")
+
+rpart_fit <- rpart_wflow %>%
+  finalize_workflow(params) %>%
+  fit(credit_train)
+
+
+model_train_performance <- add_predictions(model_train_performance,
+                                           rpart_fit,
+                                           credit_train,
+                                           "rpart_pred_1",
+                                           "rpart_pred_0")
+
+model_test_performance <- add_predictions(model_test_performance,
+                                          rpart_fit,
+                                          credit_test,
+                                          "rpart_pred_1",
+                                          "rpart_pred_0")
+```
+
+### Las losowy
+
+Mówiąc w skrócie - las losowy to *bagging* oraz *losowy dobór zmiennych*. Zamiast jednego drzewa decyzyjnego, jak powyżej, tworzone jest ich wiele. Dane treningowe do każdego mniejszego modelu są losowane ze zwracaniem z całego zbioru treningowego, dodatkowo, predyktory do modelu są także losowane (jest to hiperparametr *mtry*). W procesie kroswalidalicji sprawdzane będzie, dla jakiej wartości mtry model wykazuje najlepsze właściwości predykcyjne.
+
+```{r ranger_model, echo=TRUE, cache=TRUE}
+ranger_model <- rand_forest(mtry = tune()) %>% 
+  set_engine("ranger",
+             importance = "impurity") %>% 
+  set_mode("classification")
+
+ranger_wflow <- workflow() %>%
+  add_model(ranger_model) %>%
+  add_recipe(credit_recipe)
+
+ranger_tune <- ranger_wflow %>% tune_grid(
+  resamples = vfold_cv(credit_train, v = 5, strata = loan_status),
+  grid = 10,
+  metrics = metric_set(roc_auc),
+  control = control_grid(verbose = TRUE)
+)
+```
+
+Model lasu losowego najlepiej radzi sobie z klasyfikacją klientów na zbiorze treningowym, gdy wybiera spośród 7 predyktorów dostępnych w danych.
+
+```{r ranger_model2}
+show_best(ranger_tune, metric = "roc_auc") %>% 
+  kable() %>%
+  kable_material(c("striped", "hover")) %>%
+  row_spec(0, background = "cadetblue")
+  
+autoplot(ranger_tune)
+```
+
+Dla takiej też wartości mtry model zostaje ostatecznie wybrany i przy jego użyciu zaestymowane są prawdopodobieństwa przynależności do danej klasy klientów znajdujących się z zbiorze zarówno treningowym jak i testowym.
+
+```{r ranger_model3, echo=TRUE,cache=TRUE}
+params <- select_best(ranger_tune, metric = "roc_auc")
+
+ranger_fit <- ranger_wflow %>% 
+  finalize_workflow(params) %>%
+  fit(credit_train)
+
+model_train_performance <- add_predictions(model_train_performance,
+                                           ranger_fit,
+                                           credit_train,
+                                           "ranger_pred_1",
+                                           "ranger_pred_0")
+
+model_test_performance <- add_predictions(model_test_performance,
+                                          ranger_fit,
+                                          credit_test,
+                                          "ranger_pred_1",
+                                          "ranger_pred_0")
+```
+
+## Ewaluacja na zbiorze testowym
+
+Najlepsze zdolności predykcyjne wykazują modele oparte na drzewach (odpowiednio - las losowy oraz drzewo decyzyjne). Najgorzej z predykcją radzi sobie naiwny klasyfikator bayesowski, który został zastosowany raczej wyłącznie z celach dydaktycznych. 
+
+```{r ewaluacja}
+ bind_rows(
+  roc_auc(model_test_performance, actual, glm_pred_1) %>% mutate(model = "glm"),
+  roc_auc(model_test_performance, actual, bayes_pred_1) %>% mutate(model = "naive_bayes"),
+  roc_auc(model_test_performance, actual, knn_pred_1) %>% mutate(model = "knn"),
+  roc_auc(model_test_performance, actual, rpart_pred_1) %>% mutate(model = "rpart"),
+  roc_auc(model_test_performance, actual, ranger_pred_1) %>% mutate(model = "ranger")
+) %>% 
+  arrange(desc(.estimate)) %>% 
+  kable() %>%
+  kable_material(c("striped", "hover")) %>%
+  row_spec(0, background = "cadetblue")
+  
+```
+
+Wprawdzie model lasu losowego ma bezsprzecznie większą wartość AUC, jednak na poniższym wykresie widać, że radzi on sobie lepiej od klasycznego drzewa decyzyjnego tylko dla swoistości poniżej 0.5 oraz czułosci ok. 0.9. Powyżej tych wartości drzewo ma w zasadzie taka sama zdolność predykcyjną jak las losowy, przy czym to pierwsze można dodatkowo zinterpretować, co niesie dodatkową wartość, jeśli zachodzi taka potrzeba.
+
+```{r roc_curve1}
+roc_ranger <- roc_curve(model_test_performance, actual, ranger_pred_1) %>% 
+  mutate(model = "ranger")
+roc_rpart <- roc_curve(model_test_performance, actual, rpart_pred_1) %>% 
+  mutate(model = "rpart")
+
+roc_trees <- bind_rows(
+  roc_ranger,
+  roc_rpart
+)
+
+ggplot(roc_trees, aes(x = 1 - specificity, y = sensitivity, col = model)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw()
+
+```
+
+Pozostałe modele mają podobną krzywą ROC, jednak KNN jest wyraźnie lepszy od regresji logistycznej oraz naiwnego Bayesa, gdy swoistość jest mniejsza od ok. 12% a czułość ok. 80%.
+
+```{r roc_others}
+roc_glm <- roc_curve(model_test_performance, actual, glm_pred_1) %>% 
+  mutate(model = "glm")
+roc_knn <- roc_curve(model_test_performance, actual, knn_pred_1) %>% 
+  mutate(model = "knn")
+roc_bayes <- roc_curve(model_test_performance, actual, bayes_pred_1) %>% 
+  mutate(model = "naive_Bayes")
+
+roc_others <- bind_rows(
+  roc_glm,
+  roc_knn,
+  roc_bayes
+)
+
+ggplot(roc_others, aes(x = 1 - specificity, y = sensitivity, col = model)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw()
+```
+
+Dla lasu losowego - czyli nominalnie modelu charakteryzującego się najlepszymi zdolnościami predykcyjnymi spośród pozostałych, możemy graficznie przedstawić wartości czułości oraz swoistości dla konkretnej wartości thresholdu, co może okazać się pomocne w ostatecznym procesie decyzyjnym. 
+
+```{r pr_rec_thresh}
+roc_trees %>% 
+  filter(model=="ranger") %>% 
+  pivot_longer(cols = 2:3,
+               names_to="measure",
+               values_to = "value") %>% 
+  ggplot(aes(.threshold, value, col=measure))+
+  geom_line()
+```
+
+## Który model jest najlepszy ?
+
+Choć model lasu losowego maksymalizuje ustaloną na początku analizy metrykę - pole pod krzywą ROC, wydaje się być oczywistym wyborem jako najlepszy i przeznaczony do wykorzystania na produkcji. Jednak trzeba zwrócić uwagę na to, że pozostałe modele - mimo, że wartość AUC mają mniejszą, to jednak nie aż tak małą, aby można je było dyskwalifikować, szczególnie, że drzewo decyzyjne oraz regresja logistyczna to metody, których odpowiedź możemy w pełni interpretować i przedstawić innym osobom. Niełatwy jest zatem wybór pomiędzy metodą maksymalizującą zadaną na początku wartość metryki czy innymi mającymi nieco mniejszą wartość AUC, ale mogącymi być w pełni zinterpretowanymi i wykorzystanymi do wnioskowania statystycznego (szczególnie regresja logistyczna jako metoda parametryczna).
